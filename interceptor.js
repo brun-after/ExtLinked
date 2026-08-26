@@ -1,7 +1,37 @@
 // interceptor.js
-// v1.0 - 10/08/2026 - versao inicial (filtro Voyager - nao funcionou)
-// v1.1 - 10/08/2026 - modo diagnostico, captura tudo
-// v2.0 - 10/08/2026 - coletor SDUI com pareamento POSICIONAL de autor/texto
+// v2.6 - 26/08/2026 - SEIS CORRECOES. Em ordem de impacto no produto:
+//                     1) TEXTO COMPLETO. A v2.5 so concatenava os nos da
+//                        profundidade MINIMA e exigia run de 120+ chars com
+//                        3+ palavras funcionais. Post de varios paragrafos
+//                        parava no fim do primeiro: o miolo e a conclusao -
+//                        onde mora a tese - ficavam de fora. Agora a janela
+//                        e [minProf, minProf+1] (comentario vive em prof~4,
+//                        entao continua fora), runs curtas (25+ chars) sao
+//                        aceitas quando acompanham um nucleo forte, o teto
+//                        por run subiu de 3000 para 8000 e ha deduplicacao
+//                        por continencia para nao repetir paragrafo.
+//                     2) COMENTARIOS. Passam a ser coletados das rows
+//                        contaminadas por urn:li:comment, pareados com o
+//                        post pelo activityId de dentro do proprio urn, com
+//                        autor por proximidade. Sem isso o Gemini sugeria
+//                        angulo que ja estava na segunda resposta.
+//                     3) AUTOR. Cobertura era ~47%: o par so fechava com o
+//                        aria-label localizado "Perfil Nº". Agora ha duas
+//                        ancoras secundarias, ambas independentes de idioma:
+//                        (a) rotulo generico "aria-label" adjacente ao slug;
+//                        (b) slug DOMINANTE da row rasa (foto + nome +
+//                        headline apontam para o mesmo perfil) quando ele e
+//                        tambem o primeiro da row. Slug de quem reagiu ou de
+//                        empresa citada nao satisfaz nenhuma das duas. Fica
+//                        registrado em autor.confianca/autor.fonte.
+//                     4) SLUG COM ACENTO. A classe [A-Za-z0-9-_%] truncava
+//                        em caractere nao-ASCII: 'prime-class-solu'. Agora
+//                        aceita UTF-8 literal e escape \uXXXX, e normaliza.
+//                     5) PATROCINADO. Marcadores de anuncio na subarvore do
+//                        post viram patrocinado:true na origem, em vez de
+//                        entrar no pipeline como organico.
+//                     6) VERSAO. Uma unica constante VERSAO, exposta em
+//                        window.__radar.versao, no painel e no JSON baixado.
 // v2.5 - 10/08/2026 - CORRECAO CRITICA DA v2.4. Pegar "o slug mais raso"
 //                     dava 100% de cobertura FALSA: o slug capturado era de
 //                     quem reagiu ao post ou da empresa citada, nao do autor.
@@ -53,8 +83,15 @@
 //                        para texto de row limpa.
 //                     Validado contra payload real: 4/4 posts, autores
 //                     corretamente atribuidos.
+// v2.0 - 10/08/2026 - coletor SDUI com pareamento POSICIONAL de autor/texto
+// v1.1 - 10/08/2026 - modo diagnostico, captura tudo
+// v1.0 - 10/08/2026 - versao inicial (filtro Voyager - nao funcionou)
 
 (() => {
+  // v2.6 (6): fonte unica da versao. Painel, window.__radar e o JSON
+  // baixado leem daqui - nao existe mais numero solto no arquivo.
+  const VERSAO = '2.6';
+
   const ROTA_FEED = 'rsc-action/actions/pagination';
   const MODO_SONDA = location.pathname.includes('/feed/update/');
 
@@ -70,9 +107,24 @@
   const RE_ATIV   = /urn:li:activity:(\d+)/g;
   // v2.2: qualificadores em qualquer ordem e quantidade antes de "Perfil"
   const RE_AUTOR  = /"aria-label":"([^"]{2,70}?)\s+((?:(?:Usuário(?:\s+verificado)?|Premium)\s+)*)Perfil\s+([123])[ºo°]"/;
-  const RE_TEXTO  = /"((?:[^"\\]|\\.){120,3000})"/g;
-  const PALAVRAS  = /\b(que|para|com|uma|não|mais|você|isso|porque|como|quando)\b/gi;
+  // v2.6 (3): rotulo generico, sem depender do idioma da conta
+  const RE_ROTULO = /"aria-label":"([^"]{2,70})"/g;
+  const RE_NOME_TXT = /"(?:text|name|title)":"([^"\\]{2,70})"/g;
+  // v2.6 (1): piso de 40 (era 120) e teto de 8000 (era 3000). O piso baixo
+  // so entra no corpo se houver nucleo forte na mesma janela - ver
+  // montaTexto(). O teto alto evita cortar post longo no meio.
+  const RE_TEXTO  = /"((?:[^"\\]|\\.){40,8000})"/g;
+  const PALAVRAS  = /\b(que|para|com|uma|não|nao|mais|você|voce|isso|porque|como|quando|mas|também|tambem|sobre|sem|pelo|pela|meu|minha|nosso|seu)\b/gi;
   const RE_CONT   = /"\$case":"id","id":"([^"]{3,160})"\}\}(?:,"namespace":""\})?\},"value":\{"\$case":"intValue","intValue":(\d+)\}/g;
+
+  // v2.6 (2): o urn de comentario carrega o activityId do post pai.
+  // Formatos vistos: urn:li:comment:(urn:li:activity:123,456) e
+  // urn:li:comment:(urn:li:ugcPost:123,456).
+  const RE_COMENT = /urn:li:comment:\((?:urn:li:(?:activity|ugcPost|share):)?(\d+)\s*,\s*(\d+)\)/g;
+
+  // v2.6 (5): marcadores de anuncio. Lista fechada de propositos, para nao
+  // flagar post organico que apenas cita a palavra "patrocinado".
+  const RE_PATROC = /(urn:li:sponsoredCreative|urn:li:sponsoredAccount|urn:li:sponsoredCampaign|"sponsoredCreative|"isSponsored":\s*true|"promoted":\s*true|"adUrn"|"sponsoredLabel"|"(?:Patrocinado|Patrocinada|Promovido|Promovida|Promoted|Sponsored|Anúncio|Publicidade)")/i;
 
   function quebraRows(txt) {
     const rows = new Map();
@@ -116,103 +168,323 @@
     }
     for (const lista of out.values()) {
       lista.sort((a, b) => b.tam - a.tam);
-      lista.length = Math.min(lista.length, 4);   // teto de custo
+      lista.length = Math.min(lista.length, 6);   // v2.6: teto 4 -> 6
     }
     return out;
   }
 
   const SO_URL = /^https?:\/\/\S+$/;
   // v2.4: ancora primaria de autor
-  const RE_SLUG = /linkedin\.com\/(in|company)\/([A-Za-z0-9\-_%]{2,60})/g;
+  // v2.6 (4): a classe antiga [A-Za-z0-9-_%] parava no primeiro caractere
+  // nao-ASCII e devolvia 'prime-class-solu'. Agora aceita UTF-8 literal e
+  // escape \uXXXX; a normalizacao decodifica e limpa a borda.
+  const RE_SLUG = /linkedin\.com\/(in|company)\/((?:[A-Za-z0-9\-_%.]|\\u[0-9a-fA-F]{4}|[^\x00-\x7F"\\/?#\s])+)/g;
+
+  function normalizaSlug(bruto) {
+    let s = String(bruto)
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/\\+$/, '');
+    try { s = decodeURIComponent(s); } catch (e) { /* slug com % solto */ }
+    // remove pontuacao de borda que veio do JSON, preserva letra acentuada
+    return s.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  }
+
+  function desescapa(s) {
+    return s
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, ' ')
+      .replace(/\\"/g, '"')
+      .replace(/\\\//g, '/')
+      .replace(/\\\\/g, '\\');
+  }
+
+  function palavrasFuncionais(s) {
+    PALAVRAS.lastIndex = 0;
+    return (s.match(PALAVRAS) || []).length;
+  }
+
+  // v2.6 (1): descarta run que e chave/id/serializacao, nao prosa.
+  function pareceLixo(s) {
+    if (s.includes('$L') || s.startsWith('_')) return true;
+    if (SO_URL.test(s)) return true;
+    if (/^[A-Za-z0-9+/=]{40,}$/.test(s)) return true;              // base64/id
+    if (/urn:li:/.test(s) && palavrasFuncionais(s) < 3) return true;
+    if (/^[\w.-]+$/.test(s)) return true;                          // token unico
+    return false;
+  }
+
+  // v2.6 (1): monta o corpo inteiro do post.
+  // Regra: o NUCLEO sao as runs longas com prosa; a janela de profundidade
+  // aceita e [minProf, minProf+1] - medido: corpo em prof 1, comentario em
+  // prof 4, entao o +1 pega a continuacao do corpo sem deixar comentario
+  // entrar. Dentro da janela, runs curtas (paragrafo de uma linha, pergunta
+  // final, assinatura) tambem entram, desde que venham de row nao
+  // contaminada por urn:li:comment.
+  function montaTexto(cands) {
+    // v2.1 preservado: row limpa vence row contaminada por urn:li:comment.
+    // So se nao existir nucleo limpo o corpo e buscado nas contaminadas.
+    const limpo = cands.filter(c => c.forte && !c.comentario);
+    const nucleo = limpo.length ? limpo : cands.filter(c => c.forte);
+    if (!nucleo.length) return null;
+    const soLimpas = limpo.length > 0;
+    const minProf = Math.min(...nucleo.map(c => c.prof));
+
+    const escolhidos = cands
+      .filter(c => c.prof >= minProf && c.prof <= minProf + 1)
+      .filter(c => !(soLimpas && c.comentario))
+      .filter(c => c.forte || (c.s.length >= 25 && palavrasFuncionais(c.s) >= 1))
+      .sort((a, b) => (a.prof - b.prof) || (a.ordem - b.ordem));
+
+    // deduplicacao por continencia: paragrafo repetido em outra row, ou run
+    // curta que ja esta dentro de uma run longa, nao entra duas vezes.
+    const partes = [];
+    for (const c of escolhidos) {
+      const t = desescapa(c.s).trim();
+      if (!t) continue;
+      let engole = false;
+      for (let i = 0; i < partes.length; i++) {
+        if (partes[i] === t || partes[i].includes(t)) { engole = true; break; }
+        if (t.includes(partes[i])) { partes[i] = t; engole = true; break; }
+      }
+      if (!engole) partes.push(t);
+    }
+    const texto = partes.join('\n\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\s*…\s*(ver mais|see more|mais)\s*$/i, '')
+      .trim();
+    return texto || null;
+  }
+
+  // v2.6 (3): limpa qualificador que gruda no nome de exibicao.
+  function limpaNome(n) {
+    return String(n)
+      .replace(/\s*(Usuário(\s+verificado)?|Premium|Verified|Influencer)\s*/gi, ' ')
+      .replace(/\s*•?\s*(Perfil\s*)?[123][ºo°]\s*(grau)?\s*$/i, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim() || null;
+  }
+
+  // v2.6 (3): ancoras secundarias de autor, todas independentes de idioma.
+  // Ordem de confianca: alta (aria-label "Perfil Nº" adjacente ao slug) >
+  // media (rotulo generico adjacente, ou slug dominante que tambem e o
+  // primeiro da row) > baixa (palpite, entra como incerto).
+  function resolveAutorDaRow(v, prof) {
+    const achados = [];
+    let g; RE_SLUG.lastIndex = 0;
+    while ((g = RE_SLUG.exec(v)) !== null) {
+      const slug = normalizaSlug(g[2]);
+      if (slug.length >= 2) achados.push({ i: g.index, tipo: g[1], slug });
+    }
+    if (!achados.length) return null;
+
+    // (a) ancora primaria: rotulo com grau de conexao
+    const rot = RE_AUTOR.exec(v);
+    if (rot) {
+      const alvo = rot.index;
+      const perto = achados
+        .map(s => ({ s, d: Math.abs(s.i - alvo) }))
+        .sort((a, b) => a.d - b.d)[0];
+      if (perto.d < 4000) {                        // adjacencia no mesmo card
+        return { prof, tipo: perto.s.tipo, slug: perto.s.slug,
+                 nome: limpaNome(rot[1]), grau: rot[3] + 'o',
+                 certo: true, confianca: 'alta', fonte: 'aria-label-grau' };
+      }
+    }
+
+    // as ancoras secundarias so valem no card do autor, que e raso.
+    // Mais fundo o que aparece e reacao, mencao e empresa citada.
+    if (prof <= 1) {
+      const primeiro = achados[0];
+      const contagem = achados.reduce((acc, a) => {
+        acc[a.slug] = (acc[a.slug] || 0) + 1; return acc;
+      }, {});
+      const dominante = Object.entries(contagem).sort((a, b) => b[1] - a[1])[0];
+
+      // (b) rotulo generico colado no primeiro slug (foto do autor)
+      let nomeProx = null, melhor = Infinity;
+      let r; RE_ROTULO.lastIndex = 0;
+      while ((r = RE_ROTULO.exec(v)) !== null) {
+        const d = primeiro.i - r.index;
+        if (d >= 0 && d < melhor && d < 1500) { melhor = d; nomeProx = r[1]; }
+      }
+      // (c) slug dominante: foto + nome + headline apontam para o mesmo
+      // perfil. Quem so reagiu aparece uma vez so.
+      const ehDominante = dominante && dominante[0] === primeiro.slug &&
+                          dominante[1] >= 2;
+
+      if (nomeProx || ehDominante) {
+        let nome = limpaNome(nomeProx || '');
+        if (!nome) {                                // ultimo recurso: campo texto
+          let t, alvo = Infinity; RE_NOME_TXT.lastIndex = 0;
+          while ((t = RE_NOME_TXT.exec(v)) !== null) {
+            const d = primeiro.i - t.index;
+            if (d >= 0 && d < alvo && d < 1200) { alvo = d; nome = limpaNome(t[1]); }
+          }
+        }
+        return { prof, tipo: primeiro.tipo, slug: primeiro.slug, nome,
+                 grau: null, certo: true, confianca: 'media',
+                 fonte: nomeProx ? 'rotulo-adjacente' : 'slug-dominante' };
+      }
+    }
+
+    // (d) sem ancora: palpite, nunca confirmado
+    return { prof, tipo: achados[0].tipo, slug: achados[0].slug, nome: null,
+             grau: null, certo: false, confianca: 'baixa', fonte: 'primeiro-slug' };
+  }
+
+  const RANK = { alta: 0, media: 1, baixa: 2 };
 
   // v2.2: BFS com profundidade. O corpo do post vive na profundidade
   // minima da subarvore; comentario e conteudo relacionado vivem mais fundo.
-  function coletaDaSubarvore(rows, raiz, limite = 400) {
+  function coletaDaSubarvore(rows, raiz, limite = 1200) {   // v2.6: 400 -> 1200
     const vistos = new Set();
     const fila = [{ r: raiz, prof: 0 }];
-    const cands = [], slugs = [];
-    let autor = null, ordem = 0;
+    const cands = [], autores = [];
+    let autor = null, ordem = 0, patrocinado = false;
 
     while (fila.length && vistos.size < limite) {
       const { r, prof } = fila.shift();          // FIFO = BFS
       if (vistos.has(r) || !rows.has(r)) continue;
       vistos.add(r);
       const v = rows.get(r);
+      const ehComentario = v.includes('urn:li:comment');
+
+      // v2.6 (5): marcador de anuncio na subarvore do proprio post
+      if (!patrocinado && RE_PATROC.test(v)) patrocinado = true;
 
       let m; RE_TEXTO.lastIndex = 0;
       while ((m = RE_TEXTO.exec(v)) !== null) {
         const s = m[1];
-        if (s.includes('$L') || s.startsWith('_')) continue;
-        if ((s.match(PALAVRAS) || []).length < 3) continue;
-        cands.push({ prof, ordem: ordem++, s });
+        if (pareceLixo(s)) continue;
+        const forte = s.length >= 120 && palavrasFuncionais(s) >= 3;
+        if (!forte && palavrasFuncionais(s) < 1) continue;
+        cands.push({ prof, ordem: ordem++, s, forte, comentario: ehComentario });
       }
 
       // v2.5: pareia slug com o rotulo do autor DENTRO da mesma row.
-      // O link do autor fica adjacente ao proprio aria-label; slugs longe
-      // dele sao de quem reagiu, de mencao no texto ou de empresa citada.
-      const achados = [];
-      let g; RE_SLUG.lastIndex = 0;
-      while ((g = RE_SLUG.exec(v)) !== null) {
-        achados.push({ i: g.index, tipo: g[1], slug: decodeURIComponent(g[2]) });
-      }
-      if (achados.length) {
-        const rot = RE_AUTOR.exec(v);
-        if (rot) {
-          const alvo = rot.index;
-          const perto = achados
-            .map(s => ({ s, d: Math.abs(s.i - alvo) }))
-            .sort((a, b) => a.d - b.d)[0];
-          if (perto.d < 4000) {                      // adjacencia no mesmo card
-            slugs.push({ prof, tipo: perto.s.tipo, slug: perto.s.slug,
-                         nome: rot[1].trim(),
-                         grau: rot[3] + 'o', certo: true });
-          }
-        } else {
-          // sem rotulo: guarda como palpite, nunca como confirmado
-          slugs.push({ prof, tipo: achados[0].tipo, slug: achados[0].slug,
-                       certo: false });
-        }
+      // v2.6 (3): com duas ancoras secundarias independentes de idioma.
+      if (!ehComentario) {
+        const a = resolveAutorDaRow(v, prof);
+        if (a) autores.push(a);
       }
 
       let r2; RE_REF.lastIndex = 0;
       while ((r2 = RE_REF.exec(v)) !== null) fila.push({ r: r2[1], prof: prof + 1 });
     }
 
-    let texto = null;
-    if (cands.length) {
-      const minProf = Math.min(...cands.map(c => c.prof));
-      texto = cands
-        .filter(c => c.prof === minProf)         // so o nivel mais raso
-        .sort((a, b) => a.ordem - b.ordem)       // ordem do documento
-        .map(c => c.s)
-        .join('\n\n')
-        .replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
-    }
-    // v2.5: par confirmado vence palpite; entre iguais, o mais raso
-    if (slugs.length) {
-      slugs.sort((a, b) => (b.certo - a.certo) || (a.prof - b.prof));
-      const s0 = slugs[0];
+    const texto = montaTexto(cands);
+
+    // melhor confianca vence; entre iguais, o mais raso
+    if (autores.length) {
+      autores.sort((a, b) => (RANK[a.confianca] - RANK[b.confianca]) || (a.prof - b.prof));
+      const s0 = autores[0];
       autor = { slug: s0.slug, tipo: s0.tipo, nome: s0.nome || null,
-                grau: s0.grau || null, incerto: !s0.certo };
+                grau: s0.grau || null, incerto: !s0.certo,
+                confianca: s0.confianca, fonte: s0.fonte };
     }
-    return { texto, autor, rowsVisitadas: vistos.size };
+    return { texto, autor, patrocinado, rowsVisitadas: vistos.size };
+  }
+
+  // =====================================================================
+  // COMENTARIOS  (v2.6 - ponto 2)
+  // =====================================================================
+  // As rows de comentario carregam o activityId do post pai dentro do
+  // proprio urn:li:comment:(...,...), entao o pareamento nao depende de
+  // posicao nem da subarvore do post. Dentro da row, cada texto e casado
+  // com o slug/rotulo que vem imediatamente antes dele.
+  const TETO_COMENT = 20;
+
+  function comentariosDaRow(v) {
+    const marcas = [];
+    let g; RE_SLUG.lastIndex = 0;
+    while ((g = RE_SLUG.exec(v)) !== null) {
+      const slug = normalizaSlug(g[2]);
+      if (slug.length >= 2) marcas.push({ i: g.index, slug });
+    }
+    const rotulos = [];
+    let r; RE_ROTULO.lastIndex = 0;
+    while ((r = RE_ROTULO.exec(v)) !== null) rotulos.push({ i: r.index, nome: r[1] });
+
+    const antesDe = (lista, pos, janela) => {
+      let melhor = null, dist = janela;
+      for (const item of lista) {
+        const d = pos - item.i;
+        if (d >= 0 && d < dist) { dist = d; melhor = item; }
+      }
+      return melhor;
+    };
+
+    const out = [];
+    let m; RE_TEXTO.lastIndex = 0;
+    while ((m = RE_TEXTO.exec(v)) !== null) {
+      const s = m[1];
+      if (pareceLixo(s)) continue;
+      // comentario costuma ser curto - piso baixo, mas exige prosa
+      if (s.length < 25 || palavrasFuncionais(s) < 1) continue;
+      const dono = antesDe(marcas, m.index, 3000);
+      const rot  = antesDe(rotulos, m.index, 3000);
+      out.push({
+        autor_slug: dono ? dono.slug : null,
+        autor_nome: rot ? limpaNome(rot.nome) : null,
+        texto: desescapa(s).trim()
+      });
+    }
+    return out;
+  }
+
+  function coletaComentarios(rows) {
+    const porPost = new Map();
+    for (const [, v] of rows) {
+      if (!v.includes('urn:li:comment')) continue;
+      const alvos = new Set();
+      let c; RE_COMENT.lastIndex = 0;
+      while ((c = RE_COMENT.exec(v)) !== null) alvos.add(c[1]);
+      if (!alvos.size) continue;
+      const itens = comentariosDaRow(v);
+      if (!itens.length) continue;
+      for (const pid of alvos) {
+        if (!porPost.has(pid)) porPost.set(pid, []);
+        porPost.get(pid).push(...itens);
+      }
+    }
+    // dedup por (autor|texto) e teto por post
+    for (const [pid, lista] of porPost) {
+      const vistos = new Set(), limpos = [];
+      for (const it of lista) {
+        const k = (it.autor_slug || '?') + '|' + it.texto;
+        if (vistos.has(k)) continue;
+        vistos.add(k);
+        limpos.push(it);
+        if (limpos.length >= TETO_COMENT) break;
+      }
+      porPost.set(pid, limpos);
+    }
+    return porPost;
   }
 
   function parseFeed(txt) {
     const rows = quebraRows(txt);
     const cont = contadoresGlobais(txt);
     const rowsPost = achaRowsPost(rows, cont);
+    const comentarios = coletaComentarios(rows);   // v2.6 (2)
     let novos = 0;
 
     for (const [pid, cc] of Object.entries(cont)) {
       if (posts.has(pid)) continue;
       // v2.3: tenta as rows-candidatas em ordem de tamanho ate completar
-      let texto = null, autor = null;
+      let texto = null, autor = null, patrocinado = false;
       for (const { rid } of (rowsPost.get(pid) || [])) {
         const r = coletaDaSubarvore(rows, rid);
-        if (r.autor && (!autor || (autor.incerto && !r.autor.incerto))) autor = r.autor;  // v2.5
-        if (!texto && r.texto && !SO_URL.test(r.texto)) texto = r.texto;
-        if (autor && !autor.incerto && texto) break;   // v2.5
+        if (r.patrocinado) patrocinado = true;
+        // v2.6 (3): troca por autor de confianca estritamente melhor
+        if (r.autor && (!autor || RANK[r.autor.confianca] < RANK[autor.confianca])) {
+          autor = r.autor;
+        }
+        // v2.6 (1): texto mais completo vence, nao o primeiro que aparecer
+        if (r.texto && !SO_URL.test(r.texto) &&
+            (!texto || r.texto.length > texto.length)) texto = r.texto;
+        if (autor && autor.confianca === 'alta' && texto && texto.length > 400) break;
       }
 
       const tipos = {}; let reacoes = 0;
@@ -224,15 +496,24 @@
         }
       }
 
+      // v2.6 (2): o corpo do post as vezes reaparece na row de comentario;
+      // nao deixa o proprio post entrar como resposta dele mesmo.
+      const listaComent = (comentarios.get(pid) || []).filter(c =>
+        !texto || (!texto.includes(c.texto) && !c.texto.includes(texto)));
+
       posts.set(pid, {
         activity_id: pid,
         permalink: 'https://www.linkedin.com/feed/update/urn:li:activity:' + pid,
         autor, texto,
+        texto_tamanho: texto ? texto.length : 0,           // v2.6 (1)
+        patrocinado,                                       // v2.6 (5)
         reacoes, reacoes_tipos: tipos,
         comentarios: cc.commentCount || 0,
+        comentarios_coletados: listaComent,                // v2.6 (2)
         reposts: cc.repostCount || 0,
-        completo: !!(autor && autor.slug && !autor.incerto && texto),  // v2.5      // v2.1: flag de qualidade
-        coletado_em: new Date().toISOString()
+        completo: !!(autor && autor.slug && !autor.incerto && texto),  // v2.5
+        coletado_em: new Date().toISOString(),
+        versao_coletor: VERSAO                             // v2.6 (6)
       });
       novos++;
     }
@@ -249,6 +530,8 @@
       // v2.0: numa pagina de post, guarda tudo para descobrir o endpoint
       // de comentarios. Anotar o sduiid que aparecer aqui.
       sondas.push({ url, tamanho: texto.length, corpo: texto });
+      // v2.6 (2): na pagina do post a thread vem completa - aproveita.
+      try { parseFeed(texto); } catch (e) {}
       render();
       return;
     }
@@ -320,10 +603,30 @@
     });
   }
 
+  function estatisticas() {
+    const arr = [...posts.values()];
+    return {
+      versao: VERSAO,
+      total: arr.length,
+      completos: arr.filter(p => p.completo).length,
+      com_autor: arr.filter(p => p.autor && p.autor.slug).length,
+      autor_alta: arr.filter(p => p.autor && p.autor.confianca === 'alta').length,
+      autor_media: arr.filter(p => p.autor && p.autor.confianca === 'media').length,
+      autor_incerto: arr.filter(p => p.autor && p.autor.incerto).length,
+      com_texto: arr.filter(p => p.texto).length,
+      texto_medio: arr.length
+        ? Math.round(arr.reduce((s, p) => s + p.texto_tamanho, 0) / arr.length) : 0,
+      com_comentarios: arr.filter(p => p.comentarios_coletados.length).length,
+      comentarios_coletados: arr.reduce((s, p) => s + p.comentarios_coletados.length, 0),
+      patrocinados: arr.filter(p => p.patrocinado).length,
+      paginas
+    };
+  }
+
   function render() {
     if (!resumo) return;
     if (MODO_SONDA) {
-      resumo.textContent = `SONDA: ${sondas.length} rsc-action capturados`;
+      resumo.textContent = `v${VERSAO} SONDA: ${sondas.length} rsc-action | ${posts.size} posts`;
       lista.innerHTML = sondas.map(s =>
         `<div style="border-bottom:1px solid #333;padding:4px 0">
            <span style="color:#4ade80">${(s.tamanho/1024)|0}KB</span><br>
@@ -331,19 +634,24 @@
       ).join('');
       return;
     }
-    const ok = [...posts.values()].filter(p => p.completo).length;
-    resumo.textContent = `${posts.size} posts | ${ok} completos | ${paginas} pgs`;
+    const e = estatisticas();
+    resumo.textContent =
+      `v${VERSAO} | ${e.total} posts | ${e.completos} completos | ` +
+      `${e.comentarios_coletados} coment | ${e.patrocinados} ads | ${e.paginas} pgs`;
     const arr = [...posts.values()]
       .sort((a, b) => b.reacoes - a.reacoes).slice(0, 12);
     lista.innerHTML = arr.map(p => {
       const tipos = Object.entries(p.reacoes_tipos)
         .filter(([, v]) => v > 0)
         .map(([k, v]) => `${k.slice(0, 4)}:${v}`).join(' ');
+      const marca = p.patrocinado ? ' <span style="color:#f87171">[ads]</span>' : '';
+      const conf = p.autor ? ` <span style="color:#888">(${p.autor.confianca})</span>` : '';
       return `<div style="border-bottom:1px solid #333;padding:4px 0">
-        <span style="color:#4ade80">${p.reacoes}r ${p.comentarios}c</span>
-        <span style="color:#93c5fd">${p.autor ? p.autor.nome : '?'}</span><br>
+        <span style="color:#4ade80">${p.reacoes}r ${p.comentarios}c/${p.comentarios_coletados.length}</span>
+        <span style="color:#93c5fd">${p.autor ? (p.autor.nome || p.autor.slug) : '?'}</span>${conf}${marca}<br>
         <span style="color:#888">${tipos}</span><br>
         <span style="color:#ddd">${(p.texto || '(sem texto)').slice(0, 90)}</span>
+        <span style="color:#666">${p.texto_tamanho ? ' [' + p.texto_tamanho + ' chars]' : ''}</span>
       </div>`;
     }).join('');
   }
@@ -383,15 +691,20 @@
   // =====================================================================
   // DOWNLOAD
   // =====================================================================
-  function baixa() {
-    const pacote = MODO_SONDA
-      ? { tipo: 'sonda_comentarios', capturado_em: new Date().toISOString(),
+  function pacoteAtual() {
+    return MODO_SONDA
+      ? { tipo: 'sonda_comentarios', versao: VERSAO,
+          capturado_em: new Date().toISOString(),
           endpoints: sondas.map(s => ({ url: s.url, tamanho: s.tamanho })),
-          amostra: sondas.sort((a, b) => b.tamanho - a.tamanho)[0]?.corpo || null }
-      : { tipo: 'feed', capturado_em: new Date().toISOString(),
-          paginas, total: posts.size, posts: [...posts.values()] };
+          posts: [...posts.values()],
+          amostra: sondas.slice().sort((a, b) => b.tamanho - a.tamanho)[0]?.corpo || null }
+      : { tipo: 'feed', versao: VERSAO, capturado_em: new Date().toISOString(),
+          paginas, total: posts.size, estatisticas: estatisticas(),
+          posts: [...posts.values()] };
+  }
 
-    const blob = new Blob([JSON.stringify(pacote, null, 2)],
+  function baixa() {
+    const blob = new Blob([JSON.stringify(pacoteAtual(), null, 2)],
                           { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -399,6 +712,23 @@
     a.click();
     URL.revokeObjectURL(a.href);
   }
+
+  // =====================================================================
+  // API DE DEPURACAO  (v2.6 - ponto 6)
+  // =====================================================================
+  // window.__radar.versao passa a vir da constante VERSAO. Era isso que
+  // travava a auditoria do agente: ele lia um numero antigo e concluia que
+  // a extensao nao tinha atualizado.
+  window.__radar = {
+    versao: VERSAO,
+    modo: MODO_SONDA ? 'sonda' : 'feed',
+    get paginas() { return paginas; },
+    get posts() { return [...posts.values()]; },
+    get sondas() { return sondas.map(s => ({ url: s.url, tamanho: s.tamanho })); },
+    stats: estatisticas,
+    json: pacoteAtual,
+    baixar: baixa
+  };
 
   if (document.body) criaPainel();
   else document.addEventListener('DOMContentLoaded', criaPainel);
