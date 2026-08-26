@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Radar - Captura",
-  "version": "2.5",
-  "description": "v2.1 - 10/08/2026 - Coletor SDUI com parser por grafo de rows RSC.",
+  "version": "2.6",
+  "description": "v2.6 - 26/08/2026 - Coletor SDUI com parser por grafo de rows RSC: corpo completo do post, comentarios da thread, autor com nivel de confianca, slug com acento e flag de patrocinado.",
   "content_scripts": [
     {
       "matches": ["https://www.linkedin.com/*"],
