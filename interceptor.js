@@ -1,4 +1,22 @@
 // interceptor.js
+// v2.8 - 27/08/2026 - ANCORA NOVA DE AUTOR, achada inspecionando a row crua
+//                     de 5 posts que a v2.7 deixou incertos (via
+//                     baixarDiag()). A row carrega
+//                     "aria-label":"Abrir menu de controle da publicação de
+//                     X" - o rotulo do botao de menu de cada post, sempre a
+//                     2491 chars de um "activityId" no payload da propria
+//                     acao. Validado nos 3 casos que a janela de 6000 chars
+//                     do diagnostico capturou: bate com o activityId do
+//                     post que estamos resolvendo em 2 (nome batia inclusive
+//                     com dado que ja tínhamos) e NAO bate no terceiro -
+//                     porque aquela row tinha um card embutido de "esta
+//                     buscando emprego" de outra pessoa, mencionado dentro
+//                     do mesmo post. Sem validar o activityId, esse rotulo
+//                     teria atribuido o post a quem nao escreveu. Por isso
+//                     a ancora so conta quando o activityId do proprio
+//                     payload da acao bate com o pid que estamos resolvendo
+//                     - e por isso ela precisa do pid, que as funcoes de
+//                     resolucao de autor nao recebiam ate agora.
 // v2.7 - 26/08/2026 - CALIBRACAO CONTRA PAYLOAD REAL (34 posts, 11 paginas).
 //                     A v2.6 acertou o corpo longo (media de 1069 chars,
 //                     maior com 3371) mas o feed real mostrou tres coisas
@@ -126,7 +144,7 @@
 (() => {
   // v2.6 (6): fonte unica da versao. Painel, window.__radar e o JSON
   // baixado leem daqui - nao existe mais numero solto no arquivo.
-  const VERSAO = '2.7';
+  const VERSAO = '2.8';
 
   const ROTA_FEED = 'rsc-action/actions/pagination';
   const MODO_SONDA = location.pathname.includes('/feed/update/');
@@ -158,6 +176,13 @@
   const RE_ATIV   = /urn:li:activity:(\d+)/g;
   // v2.2: qualificadores em qualquer ordem e quantidade antes de "Perfil"
   const RE_AUTOR  = /"aria-label":"([^"]{2,70}?)\s+((?:(?:Usuário(?:\s+verificado)?|Premium)\s+)*)Perfil\s+([123])[ºo°]"/;
+  // v2.8: nome do autor do MENU DE CONTROLE do post, validado contra o
+  // activityId do payload da propria acao (ver cabecalho). So pt-BR, como
+  // RE_AUTOR - achado por inspecao de payload real, sem variante em ingles
+  // confirmada ainda.
+  const RE_MENU = /"aria-label":"Abrir menu de controle da publica[çc][ãa]o de ([^"]{2,80})"/g;
+  const JANELA_MENU = 3500;    // medido: activityId sempre a 2491 chars
+
   // v2.6 (3): rotulo generico, sem depender do idioma da conta
   const RE_ROTULO = /"aria-label":"([^"]{2,70})"/g;
   const RE_NOME_TXT = /"(?:text|name|title)":"([^"\\]{2,70})"/g;
@@ -351,7 +376,7 @@
   // Ordem de confianca: alta (aria-label "Perfil Nº" adjacente ao slug) >
   // media (rotulo generico adjacente, ou slug dominante que tambem e o
   // primeiro da row) > baixa (palpite, entra como incerto).
-  function resolveAutorDaRow(v, prof) {
+  function resolveAutorDaRow(v, prof, pid) {
     const achados = [];
     let g; RE_SLUG.lastIndex = 0;
     while ((g = RE_SLUG.exec(v)) !== null) {
@@ -371,6 +396,27 @@
         return { prof, tipo: perto.s.tipo, slug: perto.s.slug,
                  nome: limpaNome(rot[1]), grau: rot[3] + 'o',
                  certo: true, confianca: 'alta', fonte: 'aria-label-grau' };
+      }
+    }
+
+    // (a2) v2.8: rotulo do menu de controle do post, validado contra o
+    // proprio activityId. So conta quando o payload da acao referencia o
+    // MESMO pid que estamos resolvendo - sem isso o rotulo pode ser de um
+    // card embutido (post citado, sugestao de "esta buscando emprego") que
+    // nao e o post sendo processado. Ver cabecalho v2.8.
+    let menu; RE_MENU.lastIndex = 0;
+    while ((menu = RE_MENU.exec(v)) !== null) {
+      const tail = v.slice(menu.index, menu.index + JANELA_MENU);
+      const aidm = /"activityId":"(\d+)"/.exec(tail);
+      if (!aidm || aidm[1] !== pid) continue;       // rotulo de outro post
+      const alvo = menu.index;
+      const perto = achados
+        .map(s => ({ s, d: Math.abs(s.i - alvo) }))
+        .sort((a, b) => a.d - b.d)[0];
+      if (perto && perto.d < 4000) {
+        return { prof, tipo: perto.s.tipo, slug: perto.s.slug,
+                 nome: limpaNome(menu[1]), grau: null,
+                 certo: true, confianca: 'alta', fonte: 'controle-menu' };
       }
     }
 
@@ -430,7 +476,7 @@
 
   // v2.2: BFS com profundidade. O corpo do post vive na profundidade
   // minima da subarvore; comentario e conteudo relacionado vivem mais fundo.
-  function coletaDaSubarvore(rows, raiz, limite = 1200) {   // v2.6: 400 -> 1200
+  function coletaDaSubarvore(rows, raiz, pid, limite = 1200) {   // v2.6: 400 -> 1200
     const vistos = new Set();
     const fila = [{ r: raiz, prof: 0 }];
     const cands = [], autores = [], comentaristas = [];
@@ -471,7 +517,7 @@
       // v2.5: pareia slug com o rotulo do autor DENTRO da mesma row.
       // v2.6 (3): com duas ancoras secundarias independentes de idioma.
       if (!ehComentario) {
-        const a = resolveAutorDaRow(v, prof);
+        const a = resolveAutorDaRow(v, prof, pid);
         if (a) autores.push(a);
       }
 
@@ -617,7 +663,7 @@
       let cands = [], comentaristas = [];
       const candidatas = rowsPost.get(pid) || [];
       for (const { rid } of candidatas) {
-        const r = coletaDaSubarvore(rows, rid);
+        const r = coletaDaSubarvore(rows, rid, pid);
         if (r.patrocinado) patrocinado = true;
         // v2.6 (3): troca por autor de confianca estritamente melhor
         if (r.autor && (!autor || RANK[r.autor.confianca] < RANK[autor.confianca])) {
@@ -644,8 +690,12 @@
       // v2.7: row crua guardada so para os dois casos que ainda falham -
       // autor incerto e post sem texto. E o que o botao de diagnostico
       // exporta; nao entra no JSON normal.
+      // v2.8: corte subiu de 6000 para 40000. Com 6000 o slug do autor real
+      // ficava fora da amostra em todos os 5 casos que motivaram esta
+      // versao - o diagnostico mostrava o problema (autor incerto) mas nao
+      // dado suficiente pra investigar a causa.
       if (candidatas[0] && (!autor || autor.incerto)) {
-        amostraRow.set(pid, (rows.get(candidatas[0].rid) || '').slice(0, 6000));
+        amostraRow.set(pid, (rows.get(candidatas[0].rid) || '').slice(0, 40000));
       }
 
       const post = {
