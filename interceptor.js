@@ -1,4 +1,40 @@
 // interceptor.js
+// v2.7 - 26/08/2026 - CALIBRACAO CONTRA PAYLOAD REAL (34 posts, 11 paginas).
+//                     A v2.6 acertou o corpo longo (media de 1069 chars,
+//                     maior com 3371) mas o feed real mostrou tres coisas
+//                     que o payload sintetico nao tinha:
+//                     a) CHROME DE UI DENTRO DO CORPO. Strings da interface
+//                        entravam como paragrafo: ids de tela SDUI
+//                        (com.linkedin.sdui...#hash), o erro "Nao foi
+//                        possivel ocultar a publicacao" (19 de 23 posts) e
+//                        o headline do proprio usuario logado, que vem da
+//                        navbar e apareceu em 21 posts. Agora ha tres
+//                        filtros: id de tela, headline (2+ ' | ' sem
+//                        pontuacao de frase) e - o que resolve o resto sem
+//                        depender de idioma - FREQUENCIA: run identica que
+//                        aparece em 3+ posts distintos e interface, nao
+//                        texto de post. O tally e global e os textos sao
+//                        recalculados a cada pagina.
+//                     b) COMENTARIO ERA SO LIXO. Os 28 "comentarios" da
+//                        v2.6 eram placeholder, id de tela e rotulo de
+//                        acessibilidade - zero corpo real. O payload de
+//                        feed NAO carrega o corpo dos comentarios, so o
+//                        metadado. Entao: filtro duro (nada de rotulo
+//                        duplicado como texto, nada de chrome) e, no lugar
+//                        do que nao existe, colhe o que existe - o NOME de
+//                        quem comentou, que vem no rotulo "comentario de
+//                        X". Corpo de comentario exige a pagina do post.
+//                     c) CORPO NUNCA MAIS VEM DE ROW DE COMENTARIO. Um
+//                        post (guta-tolmasquim) recebeu como 'texto' a
+//                        resposta de outra pessoa, porque o corpo dele nao
+//                        estava no payload e a v2.6 caia para a row
+//                        contaminada. Sem corpo limpo, texto fica null.
+//                     Alem disso: nucleo fraco para post curto (legenda de
+//                     imagem nao chegava a 120 chars e virava texto null em
+//                     11 de 34 posts) e autor.diag + botao de diagnostico,
+//                     porque as duas ancoras novas da v2.6 fecharam ZERO
+//                     casos no payload real e sem a row crua nao da para
+//                     saber por que.
 // v2.6 - 26/08/2026 - SEIS CORRECOES. Em ordem de impacto no produto:
 //                     1) TEXTO COMPLETO. A v2.5 so concatenava os nos da
 //                        profundidade MINIMA e exigia run de 120+ chars com
@@ -90,7 +126,7 @@
 (() => {
   // v2.6 (6): fonte unica da versao. Painel, window.__radar e o JSON
   // baixado leem daqui - nao existe mais numero solto no arquivo.
-  const VERSAO = '2.6';
+  const VERSAO = '2.7';
 
   const ROTA_FEED = 'rsc-action/actions/pagination';
   const MODO_SONDA = location.pathname.includes('/feed/update/');
@@ -98,6 +134,21 @@
   const posts = new Map();       // activityId -> objeto
   const sondas = [];             // v2.0: payloads de pagina de post
   let paginas = 0;
+
+  // v2.7: estado do filtro por frequencia. Uma run identica que aparece em
+  // posts DIFERENTES e interface (id de tela, erro de UI, headline da
+  // navbar), nao corpo de post. Medido no feed real: 5 strings apareciam
+  // em 19 a 21 dos 23 posts com texto. O tally e global e persiste entre
+  // paginas, por isso os textos sao recalculados a cada pagina nova.
+  const CHROME_MIN = 3;
+  const tallyChrome = new Map();   // texto -> Set(pid)
+  const candsPorPost = new Map();  // pid -> candidatos de texto
+  const amostraRow = new Map();    // pid -> row crua (so p/ diagnostico)
+
+  function ehChrome(t) {
+    const s = tallyChrome.get(t);
+    return !!s && s.size >= CHROME_MIN;
+  }
 
   // =====================================================================
   // PARSER  (v2.1 - resolucao por grafo de rows RSC)
@@ -121,6 +172,11 @@
   // Formatos vistos: urn:li:comment:(urn:li:activity:123,456) e
   // urn:li:comment:(urn:li:ugcPost:123,456).
   const RE_COMENT = /urn:li:comment:\((?:urn:li:(?:activity|ugcPost|share):)?(\d+)\s*,\s*(\d+)\)/g;
+
+  // v2.7: nome de quem comentou. O corpo do comentario nao vem no payload
+  // de feed, mas o rotulo de acessibilidade do menu do comentario vem, e
+  // ele carrega o nome. Cobre pt e en; sem match, o campo fica vazio.
+  const RE_COMENTARISTA = /(?:coment[áa]rio de|comment (?:by|from))\s+([^."]{2,60})\s*\.?"/i;
 
   // v2.6 (5): marcadores de anuncio. Lista fechada de propositos, para nao
   // flagar post organico que apenas cita a palavra "patrocinado".
@@ -211,7 +267,23 @@
     if (/^[A-Za-z0-9+/=]{40,}$/.test(s)) return true;              // base64/id
     if (/urn:li:/.test(s) && palavrasFuncionais(s) < 3) return true;
     if (/^[\w.-]+$/.test(s)) return true;                          // token unico
+    // v2.7: id de tela SDUI - 'com.linkedin.sdui.flagshipnav.home.Home#0'
+    if (/com\.linkedin\./.test(s)) return true;
+    if (/^[\w.]+#[0-9a-f]+$/i.test(s)) return true;
     return false;
+  }
+
+  // v2.7: headline de perfil ('Cargo | Empresa | Especialidade'). Entrava
+  // no corpo como paragrafo. Exige 2+ separadores e nenhuma pontuacao de
+  // fim de frase, para nao pegar post que usa barra vertical no meio.
+  function pareceHeadline(s) {
+    return (s.match(/\s\|\s/g) || []).length >= 2 &&
+           s.length <= 220 && !/[.!?]\s/.test(s);
+  }
+
+  // v2.7: um unico ponto de decisao sobre o que nao e prosa de post.
+  function descartavel(t) {
+    return !t || pareceLixo(t) || pareceHeadline(t) || ehChrome(t);
   }
 
   // v2.6 (1): monta o corpo inteiro do post.
@@ -222,25 +294,35 @@
   // final, assinatura) tambem entram, desde que venham de row nao
   // contaminada por urn:li:comment.
   function montaTexto(cands) {
-    // v2.1 preservado: row limpa vence row contaminada por urn:li:comment.
-    // So se nao existir nucleo limpo o corpo e buscado nas contaminadas.
-    const limpo = cands.filter(c => c.forte && !c.comentario);
-    const nucleo = limpo.length ? limpo : cands.filter(c => c.forte);
+    // v2.7: corpo NUNCA vem de row contaminada por urn:li:comment. No feed
+    // real um post ficou com a resposta de outra pessoa como 'texto',
+    // porque o corpo dele nao estava no payload e a v2.6 caia para a row
+    // de comentario. Sem corpo limpo, texto fica null - dado ausente.
+    const limpos = cands.filter(c => !c.comentario && !descartavel(c.t));
+    if (!limpos.length) return null;
+
+    // nucleo forte: run longa com prosa. Se nao houver, nucleo FRACO -
+    // 40+ chars com 2+ palavras funcionais. E o caso da legenda de foto e
+    // do post de uma linha, que na v2.6 virava texto null (11 de 34).
+    let nucleo = limpos.filter(c => c.forte);
+    let fonte = 'nucleo';
+    if (!nucleo.length) {
+      nucleo = limpos.filter(c => c.t.length >= 40 && palavrasFuncionais(c.t) >= 2);
+      fonte = 'nucleo-fraco';
+    }
     if (!nucleo.length) return null;
-    const soLimpas = limpo.length > 0;
     const minProf = Math.min(...nucleo.map(c => c.prof));
 
-    const escolhidos = cands
+    const escolhidos = limpos
       .filter(c => c.prof >= minProf && c.prof <= minProf + 1)
-      .filter(c => !(soLimpas && c.comentario))
-      .filter(c => c.forte || (c.s.length >= 25 && palavrasFuncionais(c.s) >= 1))
+      .filter(c => c.forte || (c.t.length >= 25 && palavrasFuncionais(c.t) >= 1))
       .sort((a, b) => (a.prof - b.prof) || (a.ordem - b.ordem));
 
     // deduplicacao por continencia: paragrafo repetido em outra row, ou run
     // curta que ja esta dentro de uma run longa, nao entra duas vezes.
     const partes = [];
     for (const c of escolhidos) {
-      const t = desescapa(c.s).trim();
+      const t = c.t;
       if (!t) continue;
       let engole = false;
       for (let i = 0; i < partes.length; i++) {
@@ -253,7 +335,7 @@
       .replace(/\n{3,}/g, '\n\n')
       .replace(/\s*…\s*(ver mais|see more|mais)\s*$/i, '')
       .trim();
-    return texto || null;
+    return texto ? { texto, fonte } : null;
   }
 
   // v2.6 (3): limpa qualificador que gruda no nome de exibicao.
@@ -294,12 +376,21 @@
 
     // as ancoras secundarias so valem no card do autor, que e raso.
     // Mais fundo o que aparece e reacao, mencao e empresa citada.
-    if (prof <= 1) {
-      const primeiro = achados[0];
-      const contagem = achados.reduce((acc, a) => {
-        acc[a.slug] = (acc[a.slug] || 0) + 1; return acc;
-      }, {});
-      const dominante = Object.entries(contagem).sort((a, b) => b[1] - a[1])[0];
+    // v2.7: no feed real estas duas fecharam ZERO casos - 14 posts caíram
+    // para 'baixa' e nao da para saber por que sem a row crua. Por isso a
+    // profundidade subiu para <=2 e cada resultado carrega um diag com os
+    // numeros que decidiram, exportado no botao de diagnostico.
+    const primeiro = achados[0];
+    const contagem = achados.reduce((acc, a) => {
+      acc[a.slug] = (acc[a.slug] || 0) + 1; return acc;
+    }, {});
+    const dominante = Object.entries(contagem).sort((a, b) => b[1] - a[1])[0];
+    const diag = { prof, slugs: achados.length,
+                   distintos: Object.keys(contagem).length,
+                   dominante: dominante[0], ocorrencias: dominante[1],
+                   rotulo_grau: !!rot, dist_rotulo: null };
+
+    if (prof <= 2) {
 
       // (b) rotulo generico colado no primeiro slug (foto do autor)
       let nomeProx = null, melhor = Infinity;
@@ -308,6 +399,7 @@
         const d = primeiro.i - r.index;
         if (d >= 0 && d < melhor && d < 1500) { melhor = d; nomeProx = r[1]; }
       }
+      diag.dist_rotulo = melhor === Infinity ? null : melhor;
       // (c) slug dominante: foto + nome + headline apontam para o mesmo
       // perfil. Quem so reagiu aparece uma vez so.
       const ehDominante = dominante && dominante[0] === primeiro.slug &&
@@ -323,14 +415,15 @@
           }
         }
         return { prof, tipo: primeiro.tipo, slug: primeiro.slug, nome,
-                 grau: null, certo: true, confianca: 'media',
+                 grau: null, certo: true, confianca: 'media', diag,
                  fonte: nomeProx ? 'rotulo-adjacente' : 'slug-dominante' };
       }
     }
 
     // (d) sem ancora: palpite, nunca confirmado
     return { prof, tipo: achados[0].tipo, slug: achados[0].slug, nome: null,
-             grau: null, certo: false, confianca: 'baixa', fonte: 'primeiro-slug' };
+             grau: null, certo: false, confianca: 'baixa',
+             fonte: 'primeiro-slug', diag };
   }
 
   const RANK = { alta: 0, media: 1, baixa: 2 };
@@ -340,7 +433,7 @@
   function coletaDaSubarvore(rows, raiz, limite = 1200) {   // v2.6: 400 -> 1200
     const vistos = new Set();
     const fila = [{ r: raiz, prof: 0 }];
-    const cands = [], autores = [];
+    const cands = [], autores = [], comentaristas = [];
     let autor = null, ordem = 0, patrocinado = false;
 
     while (fila.length && vistos.size < limite) {
@@ -355,11 +448,24 @@
 
       let m; RE_TEXTO.lastIndex = 0;
       while ((m = RE_TEXTO.exec(v)) !== null) {
-        const s = m[1];
-        if (pareceLixo(s)) continue;
-        const forte = s.length >= 120 && palavrasFuncionais(s) >= 3;
-        if (!forte && palavrasFuncionais(s) < 1) continue;
-        cands.push({ prof, ordem: ordem++, s, forte, comentario: ehComentario });
+        if (pareceLixo(m[1])) continue;
+        // v2.7: desescapa na coleta, para tally e filtro verem a mesma
+        // string que vai para o texto final.
+        const t = desescapa(m[1]).trim();
+        if (!t) continue;
+        const forte = t.length >= 120 && palavrasFuncionais(t) >= 3;
+        if (!forte && palavrasFuncionais(t) < 1) continue;
+        cands.push({ prof, ordem: ordem++, t, forte, comentario: ehComentario });
+      }
+
+      // v2.7: nome de quem comentou, unico dado de comentario que o feed
+      // realmente entrega.
+      if (ehComentario) {
+        let cm; const re = new RegExp(RE_COMENTARISTA.source, 'gi');
+        while ((cm = re.exec(v)) !== null) {
+          const nome = limpaNome(cm[1]);
+          if (nome && !comentaristas.includes(nome)) comentaristas.push(nome);
+        }
       }
 
       // v2.5: pareia slug com o rotulo do autor DENTRO da mesma row.
@@ -373,17 +479,17 @@
       while ((r2 = RE_REF.exec(v)) !== null) fila.push({ r: r2[1], prof: prof + 1 });
     }
 
-    const texto = montaTexto(cands);
-
-    // melhor confianca vence; entre iguais, o mais raso
+    // v2.7: o texto nao e montado aqui. O filtro por frequencia so fecha
+    // depois que todos os posts da pagina foram varridos, entao a
+    // subarvore devolve os candidatos crus e parseFeed monta no fim.
     if (autores.length) {
       autores.sort((a, b) => (RANK[a.confianca] - RANK[b.confianca]) || (a.prof - b.prof));
       const s0 = autores[0];
       autor = { slug: s0.slug, tipo: s0.tipo, nome: s0.nome || null,
                 grau: s0.grau || null, incerto: !s0.certo,
-                confianca: s0.confianca, fonte: s0.fonte };
+                confianca: s0.confianca, fonte: s0.fonte, diag: s0.diag || null };
     }
-    return { texto, autor, patrocinado, rowsVisitadas: vistos.size };
+    return { cands, autor, patrocinado, comentaristas, rowsVisitadas: vistos.size };
   }
 
   // =====================================================================
@@ -402,9 +508,15 @@
       const slug = normalizaSlug(g[2]);
       if (slug.length >= 2) marcas.push({ i: g.index, slug });
     }
+    // v2.7: guarda os rotulos para poder DESCARTAR texto que e o proprio
+    // rotulo. Era dai que vinha "Ver mais opcoes para o comentario de X."
+    // entrando como se fosse o comentario.
     const rotulos = [];
     let r; RE_ROTULO.lastIndex = 0;
-    while ((r = RE_ROTULO.exec(v)) !== null) rotulos.push({ i: r.index, nome: r[1] });
+    while ((r = RE_ROTULO.exec(v)) !== null) {
+      rotulos.push({ i: r.index, nome: r[1], texto: desescapa(r[1]).trim() });
+    }
+    const setRotulos = new Set(rotulos.map(x => x.texto));
 
     const antesDe = (lista, pos, janela) => {
       let melhor = null, dist = janela;
@@ -418,16 +530,20 @@
     const out = [];
     let m; RE_TEXTO.lastIndex = 0;
     while ((m = RE_TEXTO.exec(v)) !== null) {
-      const s = m[1];
-      if (pareceLixo(s)) continue;
-      // comentario costuma ser curto - piso baixo, mas exige prosa
-      if (s.length < 25 || palavrasFuncionais(s) < 1) continue;
+      if (pareceLixo(m[1])) continue;
+      const t = desescapa(m[1]).trim();
+      // v2.7: as tres portas que sobraram vazias no feed real - e por isso
+      // que 28 "comentarios" da v2.6 eram placeholder, id de tela e rotulo.
+      if (setRotulos.has(t)) continue;             // rotulo de acessibilidade
+      if (descartavel(t)) continue;                // chrome / headline / id
+      if (t.length < 25 || palavrasFuncionais(t) < 2) continue;
+      if (/^[^a-zA-ZÀ-ÿ]*$/.test(t)) continue;
       const dono = antesDe(marcas, m.index, 3000);
       const rot  = antesDe(rotulos, m.index, 3000);
       out.push({
         autor_slug: dono ? dono.slug : null,
         autor_nome: rot ? limpaNome(rot.nome) : null,
-        texto: desescapa(s).trim()
+        texto: t
       });
     }
     return out;
@@ -463,6 +579,30 @@
     return porPost;
   }
 
+  // v2.7: o filtro por frequencia so pode decidir depois que a pagina
+  // inteira foi varrida - e uma run vira chrome ao aparecer no 3o post,
+  // que pode ser de uma pagina posterior. Por isso os candidatos ficam
+  // guardados e TODOS os textos sao remontados a cada pagina nova.
+  function registraTally(pid, cands) {
+    for (const c of cands) {
+      if (!tallyChrome.has(c.t)) tallyChrome.set(c.t, new Set());
+      tallyChrome.get(c.t).add(pid);
+    }
+  }
+
+  function recalculaTextos() {
+    for (const [pid, post] of posts) {
+      const r = montaTexto(candsPorPost.get(pid) || []);
+      post.texto = r ? r.texto : null;
+      post.texto_fonte = r ? r.fonte : null;
+      post.texto_tamanho = r ? r.texto.length : 0;
+      post.completo = !!(post.autor && post.autor.slug &&
+                         !post.autor.incerto && post.texto);
+      post.comentarios_coletados = (post._coment || []).filter(c =>
+        !post.texto || (!post.texto.includes(c.texto) && !c.texto.includes(post.texto)));
+    }
+  }
+
   function parseFeed(txt) {
     const rows = quebraRows(txt);
     const cont = contadoresGlobais(txt);
@@ -473,18 +613,21 @@
     for (const [pid, cc] of Object.entries(cont)) {
       if (posts.has(pid)) continue;
       // v2.3: tenta as rows-candidatas em ordem de tamanho ate completar
-      let texto = null, autor = null, patrocinado = false;
-      for (const { rid } of (rowsPost.get(pid) || [])) {
+      let autor = null, patrocinado = false;
+      let cands = [], comentaristas = [];
+      const candidatas = rowsPost.get(pid) || [];
+      for (const { rid } of candidatas) {
         const r = coletaDaSubarvore(rows, rid);
         if (r.patrocinado) patrocinado = true;
         // v2.6 (3): troca por autor de confianca estritamente melhor
         if (r.autor && (!autor || RANK[r.autor.confianca] < RANK[autor.confianca])) {
           autor = r.autor;
         }
-        // v2.6 (1): texto mais completo vence, nao o primeiro que aparecer
-        if (r.texto && !SO_URL.test(r.texto) &&
-            (!texto || r.texto.length > texto.length)) texto = r.texto;
-        if (autor && autor.confianca === 'alta' && texto && texto.length > 400) break;
+        cands = cands.concat(r.cands);
+        for (const n of r.comentaristas) {
+          if (!comentaristas.includes(n)) comentaristas.push(n);
+        }
+        if (autor && autor.confianca === 'alta' && cands.some(c => c.forte)) break;
       }
 
       const tipos = {}; let reacoes = 0;
@@ -496,27 +639,45 @@
         }
       }
 
-      // v2.6 (2): o corpo do post as vezes reaparece na row de comentario;
-      // nao deixa o proprio post entrar como resposta dele mesmo.
-      const listaComent = (comentarios.get(pid) || []).filter(c =>
-        !texto || (!texto.includes(c.texto) && !c.texto.includes(texto)));
+      candsPorPost.set(pid, cands);
+      registraTally(pid, cands);
+      // v2.7: row crua guardada so para os dois casos que ainda falham -
+      // autor incerto e post sem texto. E o que o botao de diagnostico
+      // exporta; nao entra no JSON normal.
+      if (candidatas[0] && (!autor || autor.incerto)) {
+        amostraRow.set(pid, (rows.get(candidatas[0].rid) || '').slice(0, 6000));
+      }
 
-      posts.set(pid, {
+      const post = {
         activity_id: pid,
         permalink: 'https://www.linkedin.com/feed/update/urn:li:activity:' + pid,
-        autor, texto,
-        texto_tamanho: texto ? texto.length : 0,           // v2.6 (1)
+        autor, texto: null,
+        texto_tamanho: 0,
+        texto_fonte: null,                                 // v2.7
         patrocinado,                                       // v2.6 (5)
         reacoes, reacoes_tipos: tipos,
         comentarios: cc.commentCount || 0,
-        comentarios_coletados: listaComent,                // v2.6 (2)
+        comentarios_coletados: [],                         // v2.6 (2)
+        comentaristas,                                     // v2.7
         reposts: cc.repostCount || 0,
-        completo: !!(autor && autor.slug && !autor.incerto && texto),  // v2.5
+        completo: false,                                   // v2.5
         coletado_em: new Date().toISOString(),
         versao_coletor: VERSAO                             // v2.6 (6)
-      });
+      };
+      // guardado fora da serializacao: fonte para o recalculo por pagina
+      Object.defineProperty(post, '_coment', {
+        value: comentarios.get(pid) || [], enumerable: false, writable: true });
+      posts.set(pid, post);
       novos++;
     }
+
+    // um comentario pode chegar numa pagina posterior a do post
+    for (const [pid, lista] of comentarios) {
+      const p = posts.get(pid);
+      if (p && lista.length > p._coment.length) p._coment = lista;
+    }
+
+    recalculaTextos();
     return novos;
   }
 
@@ -589,8 +750,15 @@
     estiliza(btnBaixar, '#0a66c2');
     btnBaixar.onclick = baixa;
 
+    // v2.7: exporta a row crua dos posts que ainda falham (autor incerto),
+    // que e o que falta para calibrar as ancoras secundarias.
+    const btnDiag = document.createElement('button');
+    btnDiag.textContent = 'Baixar diagnóstico (autor incerto)';
+    estiliza(btnDiag, '#7c3aed');
+    btnDiag.onclick = baixaDiag;
+
     lista = document.createElement('div');
-    painel.append(resumo, btnAuto, btnBaixar, lista);
+    painel.append(resumo, btnAuto, btnBaixar, btnDiag, lista);
     document.body.appendChild(painel);
     render();
   }
@@ -614,8 +782,11 @@
       autor_media: arr.filter(p => p.autor && p.autor.confianca === 'media').length,
       autor_incerto: arr.filter(p => p.autor && p.autor.incerto).length,
       com_texto: arr.filter(p => p.texto).length,
+      texto_nucleo_fraco: arr.filter(p => p.texto_fonte === 'nucleo-fraco').length,
       texto_medio: arr.length
         ? Math.round(arr.reduce((s, p) => s + p.texto_tamanho, 0) / arr.length) : 0,
+      chrome_filtrado: [...tallyChrome.values()].filter(x => x.size >= CHROME_MIN).length,
+      comentaristas: arr.reduce((s, p) => s + p.comentaristas.length, 0),
       com_comentarios: arr.filter(p => p.comentarios_coletados.length).length,
       comentarios_coletados: arr.reduce((s, p) => s + p.comentarios_coletados.length, 0),
       patrocinados: arr.filter(p => p.patrocinado).length,
@@ -637,7 +808,8 @@
     const e = estatisticas();
     resumo.textContent =
       `v${VERSAO} | ${e.total} posts | ${e.completos} completos | ` +
-      `${e.comentarios_coletados} coment | ${e.patrocinados} ads | ${e.paginas} pgs`;
+      `${e.com_texto} c/texto | ${e.comentaristas} comentaristas | ` +
+      `${e.patrocinados} ads | ${e.chrome_filtrado} chrome | ${e.paginas} pgs`;
     const arr = [...posts.values()]
       .sort((a, b) => b.reacoes - a.reacoes).slice(0, 12);
     lista.innerHTML = arr.map(p => {
@@ -703,6 +875,37 @@
           posts: [...posts.values()] };
   }
 
+  // v2.7: pacote separado, para nao inflar o JSON de producao.
+  function pacoteDiag() {
+    const alvos = [...posts.values()].filter(p => !p.autor || p.autor.incerto);
+    return {
+      tipo: 'diagnostico_autor', versao: VERSAO,
+      capturado_em: new Date().toISOString(),
+      estatisticas: estatisticas(),
+      chrome: [...tallyChrome.entries()]
+        .filter(([, v]) => v.size >= CHROME_MIN)
+        .map(([t, v]) => ({ ocorrencias: v.size, texto: t.slice(0, 160) })),
+      casos: alvos.map(p => ({
+        activity_id: p.activity_id,
+        permalink: p.permalink,
+        patrocinado: p.patrocinado,
+        texto_tamanho: p.texto_tamanho,
+        autor: p.autor,
+        row_crua: amostraRow.get(p.activity_id) || null
+      }))
+    };
+  }
+
+  function baixaDiag() {
+    const blob = new Blob([JSON.stringify(pacoteDiag(), null, 2)],
+                          { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'diagnostico-autor.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
   function baixa() {
     const blob = new Blob([JSON.stringify(pacoteAtual(), null, 2)],
                           { type: 'application/json' });
@@ -727,7 +930,9 @@
     get sondas() { return sondas.map(s => ({ url: s.url, tamanho: s.tamanho })); },
     stats: estatisticas,
     json: pacoteAtual,
-    baixar: baixa
+    diag: pacoteDiag,
+    baixar: baixa,
+    baixarDiag: baixaDiag
   };
 
   if (document.body) criaPainel();
